@@ -128,11 +128,32 @@ PHASE2_ALLOWED = PHASE1_ALLOWED + [
     r"^docker\s+start\b", r"^docker\s+stop\b", r"^docker\s+restart\b",
     r"^docker\s+compose\s+up\b", r"^docker\s+compose\s+restart\b",
     r"^docker\s+pull\b", r"^systemctl\s+restart\b",
+    # Narrow, purpose-built script for logging manual income to Revdash
+    # -- NOT raw curl access. The script itself validates every
+    # argument (amount must be a plain number, source_type from a
+    # fixed list, date format checked) before making one fixed POST
+    # to a fixed local URL, so this can't be used to hit arbitrary
+    # hosts or inject anything into the request.
+    r"^\./add_income\.sh\b", r"^add_income\.sh\b",
 ]
 
 
 def looks_destructive(cmd):
     return any(re.search(p, cmd) for p in DESTRUCTIVE_PATTERNS)
+
+
+# Command-chaining/substitution metacharacters. None of the whitelisted
+# commands (health checks, container start/stop, add_income.sh) need
+# these to do their job -- allowing them would let a chained command
+# ride along after a legitimate-looking prefix and bypass both the
+# phase whitelist and the container-scope check entirely, e.g.
+# "cat /etc/passwd; rm -rf /" would otherwise pass because it starts
+# with the whitelisted "cat" prefix.
+SHELL_CHAIN_PATTERN = re.compile(r"[;&|`]|\$\(|\n")
+
+
+def has_shell_chaining(cmd):
+    return bool(SHELL_CHAIN_PATTERN.search(cmd))
 
 
 # Only containers named with this prefix may be started/stopped/restarted/
@@ -186,6 +207,7 @@ STATE_CHANGING_PATTERNS = [
     r"^docker\s+(start|stop|restart|pull|kill)\b",
     r"^docker\s+compose\s+(up|restart)\b",
     r"^systemctl\s+restart\b",
+    r"^\./?add_income\.sh\b",
 ]
 
 
@@ -284,6 +306,19 @@ def main():
 
         # kind == CMD
         cmd = body
+
+        if has_shell_chaining(cmd):
+            print(f"[blocked: command chaining not allowed] $ {cmd}")
+            audit(log_path, {"event": "blocked_chaining", "cmd": cmd})
+            history.append({
+                "role": "user",
+                "content": (
+                    f"Blocked: '{cmd}' contains a command-chaining character "
+                    "(; & | ` or $(). Run one command at a time -- issue this "
+                    "as separate steps instead."
+                ),
+            })
+            continue
 
         offender = out_of_scope_target(cmd)
         if offender:
